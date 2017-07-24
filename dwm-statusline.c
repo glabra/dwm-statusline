@@ -15,14 +15,12 @@
 #define TIME_FORMAT "%m/%d.%H:%M:%S"
 #define BATTERY_ID "BAT0"
 #define CPUTEMP_PATH "hwmon1/temp1_input"
-#define ALSA_HDMI "IEC958",1
+#define BRIGHTNESS_ID "intel_backlight"
 #define ALSA_SPEAKER "Master",0
 
 /* --- xcb --- */
 static xcb_connection_t *m_conn = NULL;
 static xcb_window_t m_root = {0};
-static xcb_randr_output_t m_output = XCB_RANDR_BAD_OUTPUT;
-static xcb_atom_t m_backlight = XCB_NONE;
 
 /* --- nanosleep --- */
 static struct timespec m_interval = {0, 500 * 1000000};
@@ -140,6 +138,23 @@ get_audio_volume(snd_mixer_t *handle, const char *name, const int index)
 	return (int)(current * 100 / range);
 }
 
+static int
+get_brightness()
+{
+	char buf[8];
+	int full, now;
+
+	read_sysfs_string("/sys/class/backlight/" BRIGHTNESS_ID "/max_brightness",
+			buf, sizeof(buf));
+	full = atoi(buf);
+
+	read_sysfs_string("/sys/class/backlight/" BRIGHTNESS_ID "/actual_brightness",
+			buf, sizeof(buf));
+	now = atoi(buf);
+
+	return now * 100 / full;
+}
+
 static char*
 mkvolume(char *ptr, size_t ptrlen)
 {
@@ -153,9 +168,8 @@ mkvolume(char *ptr, size_t ptrlen)
 		goto finalize;
 
 	snprintf(ptr, ptrlen,
-			"%s%s%d%%",
-			is_volume_mute(handle, ALSA_HDMI) ? "H" : "h",
-			is_volume_mute(handle, ALSA_SPEAKER) ? "M" : "m",
+			"%s%d%%",
+			is_volume_mute(handle, ALSA_SPEAKER) ? "o" : "x",
 			get_audio_volume(handle, ALSA_SPEAKER));
 
 	retptr = ptr;
@@ -168,36 +182,15 @@ finalize:
 }
 
 
-/* --- xcb --- */
 static int
 initialize_xcb_service()
 {
 	int nbr, ret = 0;
-	xcb_generic_error_t *error = NULL;
-	xcb_intern_atom_reply_t *backlight_reply = NULL;
-	xcb_randr_get_screen_resources_reply_t *res_reply = NULL;
 
 	m_conn = xcb_connect(NULL, &nbr);
 	if ((ret = xcb_connection_has_error(m_conn))) {
 		fprintf(stderr, "xcb_connection failed.\n");
-		goto defer;
-	}
-
-	backlight_reply = xcb_intern_atom_reply(
-			m_conn,
-			xcb_intern_atom(m_conn, 1, strlen("Backlight"), "Backlight"),
-			&error);
-	if (error || !backlight_reply) {
-		fprintf(stderr, "backlight support missing.\n");
-		ret = error ? error->error_code : -1;
-		goto defer;
-	}
-
-	m_backlight = backlight_reply->atom;
-	if (m_backlight == XCB_NONE) {
-		fprintf(stderr, "backlight support missing.\n");
-		ret = -1;
-		goto defer;
+		return ret;
 	}
 
 	xcb_screen_iterator_t iter;
@@ -208,29 +201,7 @@ initialize_xcb_service()
 
 		xcb_screen_t *screen = iter.data;
 		m_root = screen->root;
-
-		xcb_randr_output_t *outputs;
-		xcb_randr_get_screen_resources_cookie_t res_cookie;
-
-		res_cookie = xcb_randr_get_screen_resources (m_conn, m_root);
-		res_reply = xcb_randr_get_screen_resources_reply (m_conn, res_cookie, &error);
-
-		if (error || !res_reply) {
-			ret = error ? error->error_code : -1;
-			fprintf(stderr, "RANDR get screen resources falied.\n");
-			goto defer;
-		}
-
-		outputs = xcb_randr_get_screen_resources_outputs(res_reply);
-		m_output = outputs[0]; // TODO: set m_output by display name
 	}
-
-defer:
-	if (backlight_reply)
-		free(backlight_reply);
-
-	if (res_reply)
-		free(res_reply);
 
 	return ret;
 }
@@ -239,84 +210,6 @@ static void
 finalize_xcb_service()
 {
 	xcb_disconnect(m_conn);
-}
-
-static int32_t
-get_brightness_raw()
-{
-	int32_t ret = -1;
-	xcb_generic_error_t *error = NULL;
-	xcb_randr_get_output_property_reply_t *prop_reply = NULL;
-
-	xcb_randr_get_output_property_cookie_t prop_cookie;
-
-	prop_cookie = xcb_randr_get_output_property(
-			m_conn,
-			m_output,
-			m_backlight,
-			XCB_ATOM_NONE,
-			0, 4, 0, 0);
-
-	prop_reply = xcb_randr_get_output_property_reply(
-			m_conn,
-			prop_cookie,
-			&error);
-
-	if (error || !prop_reply)
-		goto defer;
-
-	if (prop_reply->type == XCB_ATOM_INTEGER
-			&& prop_reply->num_items == 1
-			&& prop_reply->format == 32)
-		ret = *((int32_t *) xcb_randr_get_output_property_data(prop_reply));
-
-defer:
-	if (prop_reply)
-		free(prop_reply);
-
-	return ret;
-}
-
-static int
-get_brightness()
-{
-	int ret = -1;
-	xcb_generic_error_t *error = NULL;
-	xcb_randr_query_output_property_reply_t *prop_reply = NULL;
-
-	int32_t current = get_brightness_raw();
-	if (current < 0)
-		goto defer;
-
-	xcb_randr_query_output_property_cookie_t prop_cookie;
-
-	prop_cookie = xcb_randr_query_output_property(
-			m_conn,
-			m_output,
-			m_backlight);
-
-	prop_reply = xcb_randr_query_output_property_reply(
-			m_conn,
-			prop_cookie,
-			&error);
-
-	if (error || !prop_reply)
-		goto defer;
-
-	int prop_length = xcb_randr_query_output_property_valid_values_length(prop_reply);
-	if (prop_reply->range && prop_length == 2) {
-		int32_t *values = xcb_randr_query_output_property_valid_values(prop_reply);
-		int32_t min = values[0];
-		int32_t max = values[1];
-
-		ret = (current - min) * 100 / (max - min);
-	}
-
-defer:
-	if (prop_reply)
-		free(prop_reply);
-
-	return ret;
 }
 
 static void
